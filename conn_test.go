@@ -11,10 +11,10 @@ package zk
 import (
 	"context"
 	"errors"
-	"io"
 	"math"
 	"net"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,7 +84,12 @@ func TestGetDataNoTimeout(t *testing.T) {
 	sessionCtx, cancelSession := context.WithCancel(context.Background())
 	client, _ := net.Pipe()
 
-	conn := Conn{conn: client, sessionCtx: sessionCtx, cancelSession: cancelSession}
+	conn := Conn{
+		conn:             client,
+		sessionCtx:       sessionCtx,
+		cancelSession:    cancelSession,
+		wchann: make(chan *writeRecordRequest, writeChannelSize),
+	}
 	// close conn before sending request
 	conn.Close()
 	_, err := conn.GetData("/")
@@ -92,7 +97,7 @@ func TestGetDataNoTimeout(t *testing.T) {
 	case <-time.After(defaultTimeout):
 		t.Fatalf("client should not wait for timeout if connection is closed")
 	default:
-		if err != nil && !errors.Is(errors.Unwrap(err), io.ErrClosedPipe) {
+		if err != nil && !errors.Is(errors.Unwrap(err), context.Canceled) {
 			t.Fatalf("unexpected error calling GetData: %v", err)
 		}
 	}
@@ -177,4 +182,43 @@ func TestNextXidOverflow(t *testing.T) {
 	if conn.nextXid() != 0 {
 		t.Fatalf("expected nextXid not to overflow")
 	}
+}
+
+func TestConcurentGetData(t *testing.T) {
+	// create server
+	cfg := integration.DefaultConfig()
+
+	server, err := integration.NewZKServer("3.6.2", cfg)
+	if err != nil {
+		t.Fatalf("unexpected error while initializing zk server: %v", err)
+	}
+	defer func(server *integration.ZKServer) {
+		if err = server.Shutdown(); err != nil {
+			t.Fatalf("unexpected error while shutting down zk server: %v", err)
+		}
+	}(server)
+	if err = server.Run(); err != nil {
+		t.Fatalf("unexpected error while calling RunZookeeperServer: %s", err)
+		return
+	}
+	conn, err := DialContext(context.Background(), "tcp", "127.0.0.1:2181")
+	if err != nil {
+		t.Fatalf("unexpected error dialing server: %v", err)
+	}
+	defer conn.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			res, err := conn.GetData("/")
+			if err != nil {
+				t.Errorf("unexpected error calling GetData: %v", err)
+			} else {
+				t.Logf("getData response: %+v", res)
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
